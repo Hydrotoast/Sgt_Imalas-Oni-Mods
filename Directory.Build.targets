@@ -47,22 +47,165 @@
     </ItemGroup>
 	</Target>
 
-	<!--Merges all dlls in the output folder into a single dll-->
-	<Target Name="ILRepack" AfterTargets="Build" Condition="'$(IsPacked)' == 'true'">
+	<!--
+	Target PrepareForRepack prepares repacked output based on the following properties:
+		$(RepackBuildOutput): Enable to repack merged assemblies '.dll'. Default: 'true'.
+		$(RepackOutputSymbols): Enable to repack merged debug symbols '.pdb'. Default: 'true'.
+		$(RepackDocumentationFile): Enable to repack merged documentation '.xml'. Default: 'true'.
+		$(RepackInternalize): Enable to change accessibility from public to internal for metadata in merged assemblies. Default: 'false'.
+	To exclude specific repacked output, override and disable the corresponding property.
+	-->
+	<Target Name="PrepareForRepack" DependsOnTargets="Compile">
+		<!--Enumerate merge assemblies with metadata keys to match related files '.pdb' and '.xml'.-->
 		<ItemGroup>
-			<InputAssemblies Include="$(TargetPath)" />
-			<InputAssemblies
-					Include="$(TargetDir)\*.dll"
-					Exclude="$(TargetPath); **/0Harmony.dll; **_public.dll ;**Newtonsoft.Json;**/System.*; **/Microsoft.*; **/Unity*" />
+			<ReferenceCopyLocalPaths Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' == ''">
+				<ParentDirectory>$([System.IO.Path]::GetDirectoryName('%(Identity)'))</ParentDirectory>
+			</ReferenceCopyLocalPaths>
+			<RepackMergeAssemblies
+				Include="@(ReferenceCopyLocalPaths->WithMetadataValue('Extension', '.dll')->HasMetadata('ParentDirectory'))"
+				KeepMetadata="ParentDirectory"/>
+			<RepackMergeAssemblies
+				Include="@(ReferenceCopyLocalPaths->WithMetadataValue('Extension', '.dll')->HasMetadata('NugetPackageId'))"
+				KeepMetadata="NuGetPackageId;NuGetPackageVersion;AssetType"/>
+			<RepackLibraryPaths
+				Include="@(ReferencePath->DirectoryName()->Distinct())"
+				Condition="'%(ReferencePath.CopyLocal)' == 'false'"/>
 		</ItemGroup>
+		<PropertyGroup>
+			<!--NOTE: All repacked output artifacts require $(RepackBuildOutput)='true'.-->
+			<RepackBuildOutput Condition="'$(RepackBuildOutput)' == ''">true</RepackBuildOutput>
+			<RepackOutputSymbols Condition="'$(RepackOutputSymbols)' == ''">true</RepackOutputSymbols>
+			<RepackDocumentationFile Condition="'$(RepackDocumentationFile)' == ''">true</RepackDocumentationFile>
+			<RepackInternalize Condition="'$(RepackInternalize)' == ''">false</RepackInternalize>
+			<NumRepackMergeAssemblies>@(RepackMergeAssemblies->Count())</NumRepackMergeAssemblies>
+		</PropertyGroup>
+		<!--Suggest two potential build optimizations.-->
+		<Warning
+			Text="Found dependency assemblies to repack, but repacking assemblies is disabled. Consider RepackBuildOutput='true'."
+			Condition="$(NumRepackMergeAssemblies) > 0 and !$(RepackBuildOutput)"
+			File="$(MSBuildThisFile)"
+			Code="ILR2001"/>
+		<Warning
+			Text="No dependency assemblies to repack. Consider RepackBuildOutput='false'."
+			Condition="$(NumRepackMergeAssemblies) == 0 and $(RepackBuildOutput)"
+			File="$(MSBuildThisFile)"
+			Code="ILR2002"/>
+		<!--To prevent clobbered output, disable default copies to output 'bin'.-->
+		<PropertyGroup Condition="$(NumRepackMergeAssemblies) > 0">
+			<CopyBuildOutputToOutputDirectory Condition="'$(CopyBuildOutputToOutputDirectory)' == ''">false</CopyBuildOutputToOutputDirectory>
+			<CopyOutputSymbolsToOutputDirectory Condition="'$(CopyOutputSymbolsToOutputDirectory)' == ''">false</CopyOutputSymbolsToOutputDirectory>
+			<CopyDocumentationFileToOutputDirectory Condition="'$(CopyDocumentationFileToOutputDirectory)' == ''">false</CopyDocumentationFileToOutputDirectory>
+		</PropertyGroup>
+		<!--Consume input assemblies '.dll' for repacking.-->
+		<ItemGroup>
+			<RepackMergeAssemblies Remove="@(RepackMergeAssemblies)" Condition="!$(RepackBuildOutput)"/>
+			<ReferenceCopyLocalPaths Remove="@(RepackMergeAssemblies)"/>
+		</ItemGroup>
+		<!--Consume related debug symbols files '.pdb' for repacking.-->
+		<ItemGroup Condition="$(RepackOutputSymbols)">
+			<ReferenceCopyLocalPaths
+				Remove="@(RepackMergeAssemblies)"
+				MatchOnMetadata="NuGetPackageId;NuGetPackageVersion;AssetType"
+				Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' != '' and '%(ReferenceCopyLocalPaths.Extension)' == '.pdb'"/>
+			<ReferenceCopyLocalPaths
+				Remove="@(RepackMergeAssemblies)"
+				MatchOnMetadata="ParentDirectory;Filename"
+				Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' == '' and '%(ReferenceCopyLocalPaths.Extension)' == '.pdb'"/>
+		</ItemGroup>
+		<!--Consume related documentation files '.xml' for repacking.-->
+		<ItemGroup Condition="$(RepackDocumentationFile)">
+			<ReferenceCopyLocalPaths
+				Remove="@(RepackMergeAssemblies)"
+				MatchOnMetadata="NuGetPackageId;NuGetPackageVersion;AssetType"
+				Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' != '' and '%(ReferenceCopyLocalPaths.Extension)' == '.xml'"/>
+			<ReferenceCopyLocalPaths
+				Remove="@(RepackMergeAssemblies)"
+				MatchOnMetadata="ParentDirectory;Filename"
+				Condition="'%(ReferenceCopyLocalPaths.NuGetPackageId)' == '' and '%(ReferenceCopyLocalPaths.Extension)' == '.xml'"/>
+		</ItemGroup>
+		<!--Log diagnostics if any dependency artifacts remain, i.e. copies to output 'bin'.-->
+		<PropertyGroup>
+			<_NumRepackSkipArtifacts>@(ReferenceCopyLocalPaths->Count())</_NumRepackSkipArtifacts>
+			<_SkipArtifactsPath Condition="$(_NumRepackSkipArtifacts) > 0">$(IntermediateOutputPath)ILRepack.SkipArtifacts.txt</_SkipArtifactsPath>
+		</PropertyGroup>
+		<WriteLinesToFile
+			File="$(_SkipArtifactsPath)"
+			Lines="@(ReferenceCopyLocalPaths)"
+			Overwrite="true"
+			Condition="$(_NumRepackSkipArtifacts) > 0"/>
+		<ItemGroup Condition="Exists('$(_SkipArtifactsPath)')">
+			<FileWrites Include="$(_SkipArtifactsPath)"/>
+		</ItemGroup>
+		<Warning
+			Text="Skipped repacking $(_NumRepackSkipArtifacts) dependency artifacts (see '$(_SkipArtifactsPath)'). By default, artifacts copy to output 'bin'."
+			Condition="$(_NumRepackSkipArtifacts) > 0"
+			File="$(MSBuildThisFile)"
+			Code="ILR2003"/>
+	</Target>
+
+	<!--
+	Target ILRepack has three output artifacts as items:
+		@(MainAssembly): Repacked '.dll' from merged assemblies.
+		@(_DebugSymbolsOutputPath): Repacked '.pdb' from merged debug symbols.
+		@(FinalDocFile): Repacked '.xml' from documentation.
+	The output artifacts are rebuilt if any of the corresponding transitive inputs are outdated.
+	-->
+	<Target
+		Name="ILRepack"
+		DependsOnTargets="PrepareForRepack;CopyFilesToOutputDirectory"
+		Inputs="@(IntermediateAssembly);@(_DebugSymbolsIntermediatePath);@(DocFileItem)"
+		Outputs="$(TargetPath);@(_DebugSymbolsOutputPath);@(FinalDocFile)"
+		Condition="'$(RepackBuildOutput)' == 'true'">
+		<!--Suggest potential build optimizations.-->
+		<Warning
+			Text="Potentially clobbering assemblies '.dll'. Consider CopyBuildOutputToOutputDirectory='false'."
+			Condition="$(RepackBuildOutput) and $(CopyBuildOutputToOutputDirectory)"
+			File="$(MSBuildThisFile)"
+			Code="ILR2004"/>
+		<Warning
+			Text="Potentially clobbering debug symbols '.pdb'. Consider CopyOutputSymbolsToOutputDirectory='false'."
+			Condition="$(RepackOutputSymbols) and $(CopyOutputSymbolsToOutputDirectory) and $(_DebugSymbolsProduced)"
+			File="$(MSBuildThisFile)"
+			Code="ILR2004"/>
+		<Warning
+			Text="Potentially clobbering documentation '.xml'. Consider CopyDocumentationFileToOutputDirectory='false'."
+			Condition="$(RepackDocumentationFile) and $(CopyDocumentationFileToOutputDirectory) and $(_DocumentationFileProduced)"
+			File="$(MSBuildThisFile)"
+			Code="ILR2004"/>
 
 		<ILRepack
-		  TargetKind="SameAsPrimaryAssembly"
-		  InputAssemblies="@(InputAssemblies)"
-		  Wildcards="true"
-		  LibraryPath="$(GameLibsFolder)"
-		  OutputFile="$(TargetPath)"/>
+			TargetKind="SameAsPrimaryAssembly"
+			Internalize="$(RepackInternalize)"
+			LibraryPath="@(RepackLibraryPaths)"
+			InputAssemblies="@(IntermediateAssembly);@(RepackMergeAssemblies)"
+			XmlDocumentation="$(RepackDocumentationFile)"
+			DebugInfo="$(RepackOutputSymbols)"
+			OutputFile="$(TargetPath)"
+			Condition="$(RepackBuildOutput)"/>
+
+		<!--
+		Mirror the behavior of target CopyFilesToOutputDirectory, which produces default artifacts in the output 'bin'.
+		1. For items @(FilesWrites), include output artifacts ('.dll', '.pdb', and '.xml').
+		2. For item @(MainAssembly), include output assembly ('.dll').
+		3. Log item @(MainAssembly).
+		-->
+		<ItemGroup>
+			<!--NOTE: To support MSBuild targets Clean and IncrementalClean, items @FileWrites cache paths at 'INTERMEDIATE_OUTPUT_PATH/*.FileListAbsolute.txt'. -->
+			<MainAssembly Include="$(TargetPath)" Condition="$(RepackBuildOutput) and Exists('$(TargetPath)')"/>
+			<FileWrites Include="@(MainAssembly)"/>
+			<FileWrites Include="@(_DebugSymbolsOutputPath->Exists())" Condition="$(RepackBuildOutput) and $(RepackOutputSymbols)"/>
+			<FileWrites Include="@(FinalDocFile->Exists())" Condition="$(RepackBuildOutput) and $(RepackDocumentationFile)"/>
+		</ItemGroup>
+		<Message
+			Importance="High"
+			Text="$(MSBuildProjectName) -> @(MainAssembly)"
+			Condition="$(RepackBuildOutput) and Exists('@(MainAssembly)')"/>
 	</Target>
+
+	<PropertyGroup Condition="'$(IsPacked)' == 'true'">
+		<!--Override the dependencies for PrepareForRun to control output to 'bin'.-->
+		<PrepareForRunDependsOn>PrepareForRepack;ILRepack</PrepareForRunDependsOn>
+	</PropertyGroup>
 
 	<PropertyGroup>
 		<TargetFolder Condition="'$(GameLibsFolder)' != '../Lib'">$(ModFolder)\$(TargetName)_dev\</TargetFolder>
@@ -70,7 +213,7 @@
 	</PropertyGroup>
 
 	<!--Copies the mod dll, the two yaml files and everything inside the ModAssets folder to the target mod folder-->
-	<Target Name="CopyModsToDevFolder" AfterTargets="ILRepack" Condition="'$(DoNotBuildAsMod)' != 'true'">
+	<Target Name="CopyModsToDevFolder" AfterTargets="PrepareForRun" Condition="'$(DoNotBuildAsMod)' != 'true'">
 
 		<Message Text="Executing CopyDLLs task" Importance="High" />
 
